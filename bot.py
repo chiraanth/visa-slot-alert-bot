@@ -294,29 +294,55 @@ def validate_environment() -> bool:
 
 
 # =============================================================================
-# WEB SCRAPING
+# ENHANCED WEB SCRAPING WITH ANTI-DETECTION
 # =============================================================================
 
 class VisaSlotsScraper:
-    """Web scraper for visa slots - NO AUTHENTICATION NEEDED"""
+    """Enhanced web scraper with anti-detection measures"""
     
     def __init__(self, url: str = VISA_SLOTS_URL):
         self.url = url
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self):
-        """Async context manager entry"""
-        connector = aiohttp.TCPConnector(limit=10)
+        """Async context manager entry with rotating user agents"""
+        # Rotate between different realistic user agents
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        ]
+        
+        import random
+        selected_ua = random.choice(user_agents)
+        
+        connector = aiohttp.TCPConnector(
+            limit=10,
+            ssl=False,  # Disable SSL verification if needed
+            force_close=True  # Close connections after each request
+        )
+        
         self.session = aiohttp.ClientSession(
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
+                "User-Agent": selected_ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
                 "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1"
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Cache-Control": "max-age=0",
+                "sec-ch-ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"'
             }
         )
         return self
@@ -325,9 +351,11 @@ class VisaSlotsScraper:
         """Async context manager exit"""
         if self.session:
             await self.session.close()
+            # Give time for connections to close
+            await asyncio.sleep(0.5)
 
     async def fetch_slots(self) -> List[VisaSlot]:
-        """Fetch visa slots from website with retry logic"""
+        """Fetch visa slots with enhanced anti-detection"""
         for attempt in range(MAX_RETRIES):
             try:
                 if not self.session:
@@ -335,13 +363,33 @@ class VisaSlotsScraper:
                 
                 logger.info(f"🌐 Fetching visa slots (attempt {attempt + 1}/{MAX_RETRIES})")
                 
-                async with self.session.get(self.url) as response:
+                # Add random delay between retries to appear more human-like
+                if attempt > 0:
+                    delay = RETRY_DELAY * (attempt + 1) + random.uniform(1, 3)
+                    logger.info(f"⏳ Waiting {delay:.1f}s before retry...")
+                    await asyncio.sleep(delay)
+                
+                async with self.session.get(
+                    self.url,
+                    allow_redirects=True,
+                    ssl=False  # Disable SSL verification
+                ) as response:
+                    
                     if response.status == 403:
-                        logger.warning("⚠️ Access forbidden (403). Website might be blocking scrapers.")
+                        logger.warning(f"⚠️ Access forbidden (403) - Attempt {attempt + 1}/{MAX_RETRIES}")
                         if attempt < MAX_RETRIES - 1:
-                            await asyncio.sleep(RETRY_DELAY * (attempt + 1) * 2)
+                            # Wait longer on 403
+                            await asyncio.sleep(RETRY_DELAY * (attempt + 2) * 3)
                             continue
+                        logger.error("❌ Website is blocking requests after all retries")
                         return []
+                    
+                    if response.status == 429:
+                        logger.warning("⚠️ Rate limited (429)")
+                        retry_after = int(response.headers.get('Retry-After', 60))
+                        logger.info(f"⏳ Waiting {retry_after}s as requested...")
+                        await asyncio.sleep(retry_after)
+                        continue
                     
                     if response.status != 200:
                         logger.warning(f"⚠️ HTTP {response.status} received")
@@ -359,6 +407,12 @@ class VisaSlotsScraper:
                             continue
                     
                     slots = self._parse_html(html)
+                    
+                    if not slots:
+                        logger.warning("⚠️ No slots parsed from HTML")
+                        if attempt < MAX_RETRIES - 1:
+                            continue
+                    
                     logger.info(f"✅ Successfully fetched {len(slots)} slots")
                     return slots
                     
@@ -388,6 +442,8 @@ class VisaSlotsScraper:
             
             if not tables:
                 logger.warning("⚠️ No tables found in HTML")
+                # Log a sample of the HTML for debugging
+                logger.debug(f"HTML preview: {html[:500]}")
                 return []
             
             all_slots = []
@@ -406,13 +462,12 @@ class VisaSlotsScraper:
                         )
                         all_slots.append(slot)
             
-            logger.info(f"📊 Parsed {len(all_slots)} slots from HTML")
+            logger.info(f"📊 Parsed {len(all_slots)} slots from {len(tables)} tables")
             return all_slots
             
         except Exception as e:
             logger.error(f"❌ Error parsing HTML: {e}", exc_info=True)
             return []
-
 
 # =============================================================================
 # TELEGRAM MESSAGING
