@@ -1,4 +1,8 @@
-python-telegram-bot==20.6
-requests
-beautifulsoup4
-python-dotenv
+# Core Dependencies
+python-telegram-bot==20.7
+aiohttp==3.9.3
+beautifulsoup4==4.12.3
+python-dotenv==1.0.1
+
+# Optional but recommended
+lxml==5.1.0  # Faster HTML parsing
