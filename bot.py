@@ -1,6 +1,7 @@
 """
 Visa Slot Alert Bot
 A Telegram bot that monitors visa appointment slots and sends alerts.
+NO AUTHENTICATION OR OTP REQUIRED - Scrapes public data only.
 """
 
 import asyncio
@@ -11,7 +12,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    CallbackContext,
     ContextTypes
 )
 from telegram.error import TelegramError, RetryAfter, TimedOut
@@ -19,27 +19,25 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
-from enum import Enum
 import sys
+import json
+from pathlib import Path
 
 # =============================================================================
-# CONFIGURATION & CONSTANTS
+# CONFIGURATION
 # =============================================================================
 
 load_dotenv()
 
-# Bot Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
 VISA_SLOTS_URL = os.getenv("VISA_SLOTS_URL", "https://visaslots.info/")
 
 # Logging Configuration
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=getattr(logging, LOG_LEVEL),
+    level=logging.INFO,
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler('visa_bot.log')
@@ -48,22 +46,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Menu Options
-VISA_TYPES = ["B1", "B2", "B1/B2", "F-1", "H-1B", "J-1", "L-1"]
+VISA_TYPES = ["B1", "B2", "B1/B2", "F-1", "H-1B", "J-1", "L-1", "O-1"]
 CITIES = ["ALL", "MUMBAI", "HYDERABAD", "CHENNAI", "NEW DELHI", "KOLKATA"]
 CONSULATE_TYPES = ["CONSULAR", "VAC"]
 YEAR_OPTIONS = ["No Filter", "2025", "2026", "2027"]
 INTERVALS = {
+    "1 min": 60,
     "5 min": 300,
     "10 min": 600,
     "30 min": 1800,
     "60 min": 3600
 }
 
-# Rate Limiting
+# Constants
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 REQUEST_TIMEOUT = 30
 RATE_LIMIT_DELAY = 2
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
 
 # =============================================================================
 # DATA CLASSES
@@ -78,21 +79,22 @@ class VisaSlot:
     earliest_date: str
     slots_available: str
 
-    def __str__(self) -> str:
-        return (
-            f"Location: {self.location}, "
-            f"Type: {self.visa_type}, "
-            f"Date: {self.earliest_date}, "
-            f"Slots: {self.slots_available}"
-        )
-
     def is_available(self) -> bool:
         """Check if slot is available"""
         return (
             self.slots_available != "0" and
-            self.earliest_date != "N/A" and
-            self.earliest_date.strip() != ""
+            self.earliest_date not in ["N/A", "", "No Appointments Available"]
         )
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary"""
+        return {
+            "location": self.location,
+            "visa_type": self.visa_type,
+            "last_updated": self.last_updated,
+            "earliest_date": self.earliest_date,
+            "slots_available": self.slots_available
+        }
 
 
 @dataclass
@@ -104,6 +106,7 @@ class UserPreferences:
     interval: Optional[int] = None
     year_filter: Optional[List[str]] = None
     no_slot_alert_sent: bool = False
+    last_notified_slots: List[str] = field(default_factory=list)
 
     def is_complete(self) -> bool:
         """Check if all required preferences are set"""
@@ -129,23 +132,86 @@ class UserPreferences:
             f"• Interval: {self.interval // 60 if self.interval else 'Not set'} min"
         )
 
+    def to_dict(self) -> dict:
+        """Convert to dictionary for persistence"""
+        return {
+            "visa_type": self.visa_type,
+            "consulate_city": self.consulate_city,
+            "consulate_type": self.consulate_type,
+            "interval": self.interval,
+            "year_filter": self.year_filter,
+            "no_slot_alert_sent": self.no_slot_alert_sent,
+            "last_notified_slots": self.last_notified_slots
+        }
 
-class BotState(Enum):
-    """Bot states"""
-    IDLE = "idle"
-    RUNNING = "running"
-    ERROR = "error"
+    @classmethod
+    def from_dict(cls, data: dict) -> 'UserPreferences':
+        """Create from dictionary"""
+        return cls(
+            visa_type=data.get("visa_type"),
+            consulate_city=data.get("consulate_city"),
+            consulate_type=data.get("consulate_type"),
+            interval=data.get("interval"),
+            year_filter=data.get("year_filter"),
+            no_slot_alert_sent=data.get("no_slot_alert_sent", False),
+            last_notified_slots=data.get("last_notified_slots", [])
+        )
 
 
 # =============================================================================
-# GLOBAL STATE MANAGEMENT
+# PERSISTENCE
+# =============================================================================
+
+class UserDataPersistence:
+    """Save and load user preferences"""
+    
+    def __init__(self, data_dir: Path = DATA_DIR):
+        self.data_dir = data_dir
+        self.data_file = data_dir / "user_data.json"
+
+    def save_user_data(self, user_data: Dict[int, UserPreferences]):
+        """Save user data to file"""
+        try:
+            data = {
+                str(chat_id): prefs.to_dict()
+                for chat_id, prefs in user_data.items()
+            }
+            with open(self.data_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            logger.info(f"Saved data for {len(data)} users")
+        except Exception as e:
+            logger.error(f"Error saving user data: {e}")
+
+    def load_user_data(self) -> Dict[int, UserPreferences]:
+        """Load user data from file"""
+        try:
+            if not self.data_file.exists():
+                return {}
+            
+            with open(self.data_file, 'r') as f:
+                data = json.load(f)
+            
+            user_data = {
+                int(chat_id): UserPreferences.from_dict(prefs)
+                for chat_id, prefs in data.items()
+            }
+            logger.info(f"Loaded data for {len(user_data)} users")
+            return user_data
+        except Exception as e:
+            logger.error(f"Error loading user data: {e}")
+            return {}
+
+
+# =============================================================================
+# STATE MANAGEMENT
 # =============================================================================
 
 class UserDataManager:
-    """Thread-safe user data manager"""
+    """Thread-safe user data manager with persistence"""
     
     def __init__(self):
-        self._user_data: Dict[int, UserPreferences] = {}
+        self.persistence = UserDataPersistence()
+        self._user_data: Dict[int, UserPreferences] = self.persistence.load_user_data()
         self._alert_tasks: Dict[int, asyncio.Task] = {}
         self._lock = asyncio.Lock()
 
@@ -154,7 +220,12 @@ class UserDataManager:
         async with self._lock:
             if chat_id not in self._user_data:
                 self._user_data[chat_id] = UserPreferences()
+                self._save_data()
             return self._user_data[chat_id]
+
+    def _save_data(self):
+        """Save data to disk"""
+        self.persistence.save_user_data(self._user_data)
 
     async def set_alert_task(self, chat_id: int, task: asyncio.Task):
         """Set alert task for user"""
@@ -178,26 +249,15 @@ class UserDataManager:
         return task is not None and not task.done()
 
 
-# Initialize global manager
 user_manager = UserDataManager()
 
 
 # =============================================================================
-# UTILITY FUNCTIONS
+# UTILITIES
 # =============================================================================
 
 def visa_matches_site(user_pref: str, site_visa: str) -> bool:
-    """
-    Check if user's visa preference matches site visa type
-    
-    Args:
-        user_pref: User's visa type preference
-        site_visa: Visa type from website
-        
-    Returns:
-        True if they match, False otherwise
-    """
-    # Normalize strings
+    """Check if user's visa preference matches site visa type"""
     user_pref = user_pref.upper().strip()
     site_visa = site_visa.upper().strip()
     
@@ -208,7 +268,8 @@ def visa_matches_site(user_pref: str, site_visa: str) -> bool:
         "F-1": ["F1", "F1/F2", "F-1"],
         "H-1B": ["H1B", "H-1B", "H1", "H-1"],
         "J-1": ["J1", "J-1"],
-        "L-1": ["L1", "L-1"]
+        "L-1": ["L1", "L-1"],
+        "O-1": ["O1", "O-1"]
     }
     
     if user_pref in visa_mappings:
@@ -218,16 +279,7 @@ def visa_matches_site(user_pref: str, site_visa: str) -> bool:
 
 
 def year_matches(date_str: str, year_filter: Optional[List[str]]) -> bool:
-    """
-    Check if date matches year filter
-    
-    Args:
-        date_str: Date string to check
-        year_filter: List of years to filter by
-        
-    Returns:
-        True if matches or no filter, False otherwise
-    """
+    """Check if date matches year filter"""
     if not year_filter or date_str in ["N/A", "", None]:
         return True
     return any(year in date_str for year in year_filter)
@@ -238,10 +290,6 @@ def validate_environment() -> bool:
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not found in environment variables!")
         return False
-    
-    if not CHAT_ID:
-        logger.warning("CHAT_ID not set. Bot will work but alerts won't be sent.")
-    
     return True
 
 
@@ -250,7 +298,7 @@ def validate_environment() -> bool:
 # =============================================================================
 
 class VisaSlotsScraper:
-    """Web scraper for visa slots"""
+    """Web scraper for visa slots - NO AUTHENTICATION NEEDED"""
     
     def __init__(self, url: str = VISA_SLOTS_URL):
         self.url = url
@@ -258,10 +306,17 @@ class VisaSlotsScraper:
 
     async def __aenter__(self):
         """Async context manager entry"""
+        connector = aiohttp.TCPConnector(limit=10)
         self.session = aiohttp.ClientSession(
+            connector=connector,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1"
             }
         )
         return self
@@ -272,66 +327,69 @@ class VisaSlotsScraper:
             await self.session.close()
 
     async def fetch_slots(self) -> List[VisaSlot]:
-        """
-        Fetch visa slots from website with retry logic
-        
-        Returns:
-            List of VisaSlot objects
-        """
+        """Fetch visa slots from website with retry logic"""
         for attempt in range(MAX_RETRIES):
             try:
                 if not self.session:
-                    raise RuntimeError("Session not initialized. Use async context manager.")
+                    raise RuntimeError("Session not initialized")
                 
-                logger.info(f"Fetching visa slots (attempt {attempt + 1}/{MAX_RETRIES})")
+                logger.info(f"🌐 Fetching visa slots (attempt {attempt + 1}/{MAX_RETRIES})")
                 
                 async with self.session.get(self.url) as response:
+                    if response.status == 403:
+                        logger.warning("⚠️ Access forbidden (403). Website might be blocking scrapers.")
+                        if attempt < MAX_RETRIES - 1:
+                            await asyncio.sleep(RETRY_DELAY * (attempt + 1) * 2)
+                            continue
+                        return []
+                    
                     if response.status != 200:
-                        logger.warning(f"HTTP {response.status} received")
+                        logger.warning(f"⚠️ HTTP {response.status} received")
                         if attempt < MAX_RETRIES - 1:
                             await asyncio.sleep(RETRY_DELAY * (attempt + 1))
                             continue
                         return []
                     
                     html = await response.text()
+                    
+                    if len(html) < 100:
+                        logger.warning("⚠️ Received suspiciously short response")
+                        if attempt < MAX_RETRIES - 1:
+                            await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                            continue
+                    
                     slots = self._parse_html(html)
-                    logger.info(f"Successfully fetched {len(slots)} slots")
+                    logger.info(f"✅ Successfully fetched {len(slots)} slots")
                     return slots
                     
             except asyncio.TimeoutError:
-                logger.error(f"Timeout on attempt {attempt + 1}")
+                logger.error(f"⏱️ Timeout on attempt {attempt + 1}")
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-                    continue
                     
             except aiohttp.ClientError as e:
-                logger.error(f"Client error on attempt {attempt + 1}: {e}")
+                logger.error(f"🔌 Network error on attempt {attempt + 1}: {e}")
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-                    continue
                     
             except Exception as e:
-                logger.error(f"Unexpected error fetching slots: {e}", exc_info=True)
+                logger.error(f"❌ Unexpected error: {e}", exc_info=True)
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-                    continue
         
-        logger.error("All fetch attempts failed")
+        logger.error("❌ All fetch attempts failed")
         return []
 
     def _parse_html(self, html: str) -> List[VisaSlot]:
-        """
-        Parse HTML and extract visa slots
-        
-        Args:
-            html: HTML content
-            
-        Returns:
-            List of VisaSlot objects
-        """
+        """Parse HTML and extract visa slots"""
         try:
             soup = BeautifulSoup(html, "html.parser")
             tables = soup.find_all("table")
+            
+            if not tables:
+                logger.warning("⚠️ No tables found in HTML")
+                return []
+            
             all_slots = []
             
             for table in tables:
@@ -348,10 +406,11 @@ class VisaSlotsScraper:
                         )
                         all_slots.append(slot)
             
+            logger.info(f"📊 Parsed {len(all_slots)} slots from HTML")
             return all_slots
             
         except Exception as e:
-            logger.error(f"Error parsing HTML: {e}", exc_info=True)
+            logger.error(f"❌ Error parsing HTML: {e}", exc_info=True)
             return []
 
 
@@ -360,7 +419,7 @@ class VisaSlotsScraper:
 # =============================================================================
 
 class TelegramMessenger:
-    """Handle Telegram message sending with error handling"""
+    """Handle Telegram message sending"""
     
     def __init__(self, bot_token: str):
         self.bot = Bot(token=bot_token)
@@ -372,12 +431,7 @@ class TelegramMessenger:
         parse_mode: str = "Markdown",
         reply_markup=None
     ) -> bool:
-        """
-        Send message with retry logic
-        
-        Returns:
-            True if successful, False otherwise
-        """
+        """Send message with retry logic"""
         for attempt in range(MAX_RETRIES):
             try:
                 await self.bot.send_message(
@@ -390,37 +444,39 @@ class TelegramMessenger:
                 return True
                 
             except RetryAfter as e:
-                logger.warning(f"Rate limited. Waiting {e.retry_after} seconds")
+                logger.warning(f"⏳ Rate limited. Waiting {e.retry_after}s")
                 await asyncio.sleep(e.retry_after)
                 
             except TimedOut:
-                logger.warning(f"Timeout on attempt {attempt + 1}")
+                logger.warning(f"⏱️ Timeout on attempt {attempt + 1}")
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAY)
                     
             except TelegramError as e:
-                logger.error(f"Telegram error: {e}")
+                logger.error(f"📱 Telegram error: {e}")
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAY)
                 else:
                     return False
                     
             except Exception as e:
-                logger.error(f"Unexpected error sending message: {e}", exc_info=True)
+                logger.error(f"❌ Error sending message: {e}", exc_info=True)
                 return False
         
         return False
 
-    async def send_slot_alert(self, chat_id: int, slot: VisaSlot) -> bool:
+    async def send_slot_alert(self, chat_id: int, slot: VisaSlot, is_new: bool = True) -> bool:
         """Send visa slot alert"""
+        emoji = "🆕" if is_new else "🔄"
         message = (
-            f"🚨 *Visa Slot Alert!* 🚨\n\n"
+            f"{emoji} *Visa Slot Alert!* 🚨\n\n"
             f"📍 *Location:* {slot.location}\n"
             f"📌 *Visa Type:* {slot.visa_type}\n"
-            f"⏳ *Earliest Date:* {slot.earliest_date}\n"
-            f"🟢 *Slots Available:* {slot.slots_available}\n"
-            f"⏰ *Last Updated:* {slot.last_updated}\n\n"
-            f"🔗 [Check Now]({VISA_SLOTS_URL})"
+            f"📅 *Earliest Date:* {slot.earliest_date}\n"
+            f"🟢 *Slots:* {slot.slots_available}\n"
+            f"🕐 *Updated:* {slot.last_updated}\n\n"
+            f"🔗 [Check Website]({VISA_SLOTS_URL})\n\n"
+            f"_No login required!_"
         )
         return await self.send_message(chat_id, message)
 
@@ -437,12 +493,7 @@ class SlotFilter:
         all_slots: List[VisaSlot],
         preferences: UserPreferences
     ) -> tuple[List[VisaSlot], List[VisaSlot]]:
-        """
-        Filter slots into matching and other locations
-        
-        Returns:
-            Tuple of (matching_slots, other_slots)
-        """
+        """Filter slots into matching and other locations"""
         matching_preference = []
         other_locations = []
 
@@ -462,7 +513,6 @@ class SlotFilter:
                 else:
                     other_locations.append(slot)
 
-        # Filter by availability and year
         matching_open = [
             s for s in matching_preference
             if s.is_available() and year_matches(s.earliest_date, preferences.year_filter)
@@ -488,14 +538,17 @@ class AlertSystem:
         self.scraper: Optional[VisaSlotsScraper] = None
 
     async def run_alert_loop(self, chat_id: int):
-        """
-        Main alert loop for monitoring slots
-        
-        Args:
-            chat_id: Telegram chat ID to send alerts to
-        """
+        """Main alert loop for monitoring slots"""
         preferences = await user_manager.get_preferences(chat_id)
-        logger.info(f"Starting alert loop for chat_id: {chat_id}")
+        logger.info(f"🚀 Starting alert loop for chat_id: {chat_id}")
+        
+        await self.messenger.send_message(
+            chat_id,
+            "✅ *Monitoring Started!*\n\n"
+            "🔍 Checking for slots...\n"
+            "💡 _No login or OTP needed!_",
+            parse_mode="Markdown"
+        )
         
         async with VisaSlotsScraper() as scraper:
             self.scraper = scraper
@@ -505,18 +558,25 @@ class AlertSystem:
                     try:
                         await self._check_slots(chat_id, preferences)
                     except Exception as e:
-                        logger.error(f"Error in slot check: {e}", exc_info=True)
+                        logger.error(f"❌ Error in slot check: {e}", exc_info=True)
                         await self.messenger.send_message(
                             chat_id,
-                            f"⚠️ Error checking slots: {str(e)[:100]}\n"
-                            f"Will retry in {preferences.interval // 60} minutes."
+                            f"⚠️ *Error checking slots*\n\n"
+                            f"Will retry in {preferences.interval // 60} min.\n\n"
+                            f"_Error: {str(e)[:100]}_",
+                            parse_mode="Markdown"
                         )
                     
-                    logger.info(f"Waiting {preferences.interval} seconds until next check")
+                    logger.info(f"⏰ Waiting {preferences.interval}s until next check")
                     await asyncio.sleep(preferences.interval)
                     
             except asyncio.CancelledError:
-                logger.info(f"Alert loop cancelled for chat_id: {chat_id}")
+                logger.info(f"🛑 Alert loop cancelled for chat_id: {chat_id}")
+                await self.messenger.send_message(
+                    chat_id,
+                    "🛑 *Monitoring Stopped*",
+                    parse_mode="Markdown"
+                )
                 raise
             finally:
                 await user_manager.remove_alert_task(chat_id)
@@ -526,18 +586,35 @@ class AlertSystem:
         all_slots = await self.scraper.fetch_slots()
         
         if not all_slots:
-            logger.warning("No slots data retrieved")
+            logger.warning("⚠️ No slots data retrieved")
+            if not preferences.no_slot_alert_sent:
+                await self.messenger.send_message(
+                    chat_id,
+                    "⚠️ *Could not fetch slot data*\n\n"
+                    "The website might be temporarily unavailable.\n"
+                    "Will keep trying...",
+                    parse_mode="Markdown"
+                )
+                preferences.no_slot_alert_sent = True
             return
 
         matching_open, other_open = SlotFilter.filter_slots(all_slots, preferences)
 
         if matching_open:
             preferences.no_slot_alert_sent = False
-            logger.info(f"Found {len(matching_open)} matching slots")
+            logger.info(f"✅ Found {len(matching_open)} matching slots")
             
             for slot in matching_open:
-                await self.messenger.send_slot_alert(chat_id, slot)
-                await asyncio.sleep(RATE_LIMIT_DELAY)  # Rate limiting
+                slot_key = f"{slot.location}_{slot.earliest_date}"
+                is_new = slot_key not in preferences.last_notified_slots
+                
+                await self.messenger.send_slot_alert(chat_id, slot, is_new)
+                
+                if is_new:
+                    preferences.last_notified_slots.append(slot_key)
+                    preferences.last_notified_slots = preferences.last_notified_slots[-50:]
+                
+                await asyncio.sleep(RATE_LIMIT_DELAY)
                 
         elif other_open:
             await self._send_alternative_locations(chat_id, other_open, preferences)
@@ -555,30 +632,30 @@ class AlertSystem:
             return
 
         summary_lines = [
-            "⚠️ *No slots at your preferred consulate*\n",
-            "Other open locations for your visa type:\n"
+            "⚠️ *No slots at preferred location*\n",
+            f"Found {len(other_slots)} alternatives:\n"
         ]
         
-        for slot in other_slots[:5]:  # Limit to 5
+        for slot in other_slots[:5]:
             summary_lines.append(
-                f"• {slot.location} | "
-                f"Date: {slot.earliest_date} | "
-                f"Slots: {slot.slots_available}"
+                f"• {slot.location}\n"
+                f"  📅 {slot.earliest_date} | 🟢 {slot.slots_available} slots"
             )
         
         if len(other_slots) > 5:
-            summary_lines.append(f"\n_...and {len(other_slots) - 5} more locations_")
+            summary_lines.append(f"\n_...and {len(other_slots) - 5} more_")
         
-        await self.messenger.send_message(chat_id, "\n".join(summary_lines))
+        await self.messenger.send_message(chat_id, "\n".join(summary_lines), parse_mode="Markdown")
         preferences.no_slot_alert_sent = True
 
     async def _send_no_slots_message(self, chat_id: int, preferences: UserPreferences):
-        """Send message when no slots are found"""
+        """Send message when no slots found"""
         if not preferences.no_slot_alert_sent:
             await self.messenger.send_message(
                 chat_id,
-                "ℹ️ No open slots found at this time.\n"
-                f"Next check in {preferences.interval // 60} minutes..."
+                f"ℹ️ *No slots available*\n\n"
+                f"Next check in {preferences.interval // 60} min...",
+                parse_mode="Markdown"
             )
             preferences.no_slot_alert_sent = True
 
@@ -590,19 +667,21 @@ class AlertSystem:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     chat_id = update.effective_chat.id
-    await user_manager.get_preferences(chat_id)  # Initialize
+    await user_manager.get_preferences(chat_id)
     
     welcome_message = (
-        "🤖 *Welcome to Visa Slot Alert Bot!*\n\n"
-        "I'll help you monitor visa appointment slots.\n\n"
-        "*Commands:*\n"
-        "/set\\_visa - Set visa type\n"
-        "/set\\_consulate - Set consulate location\n"
-        "/set\\_interval - Set check interval\n"
-        "/start\\_alerts - Start monitoring\n"
+        "🤖 *Visa Slot Alert Bot*\n\n"
+        "✅ NO LOGIN REQUIRED\n"
+        "✅ NO OTP NEEDED\n"
+        "✅ PUBLIC DATA ONLY\n\n"
+        "*Setup (3 steps):*\n"
+        "1️⃣ /set\\_visa - Choose visa type\n"
+        "2️⃣ /set\\_consulate - Choose location\n"
+        "3️⃣ /start\\_alerts - Start monitoring\n\n"
+        "*Other commands:*\n"
+        "/status - View settings\n"
         "/stop - Stop monitoring\n"
-        "/status - Check current settings\n"
-        "/help - Show help message"
+        "/help - Show help"
     )
     
     await update.message.reply_text(welcome_message, parse_mode="Markdown")
@@ -611,16 +690,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
     help_text = (
-        "📖 *How to use this bot:*\n\n"
-        "1️⃣ Set your visa type using /set\\_visa\n"
-        "2️⃣ Set your consulate using /set\\_consulate\n"
-        "3️⃣ Set check interval using /set\\_interval\n"
-        "4️⃣ Start monitoring with /start\\_alerts\n\n"
-        "*Tips:*\n"
-        "• Use /status to check your current settings\n"
-        "• Use /stop to stop monitoring\n"
-        "• You can change settings anytime\n\n"
-        "*Need support?* Contact the bot administrator."
+        "📖 *Help & FAQ*\n\n"
+        "*Q: Do I need to login?*\n"
+        "A: No! This bot scrapes public data.\n\n"
+        "*Q: Why no OTP?*\n"
+        "A: We use publicly available information.\n\n"
+        "*Q: How often does it check?*\n"
+        "A: You choose (1-60 min intervals)\n\n"
+        "*Setup:*\n"
+        "1. /set\\_visa\n"
+        "2. /set\\_consulate\n"
+        "3. /set\\_interval\n"
+        "4. /start\\_alerts"
     )
     
     await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -632,12 +713,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preferences = await user_manager.get_preferences(chat_id)
     is_running = await user_manager.is_running(chat_id)
     
-    status_emoji = "🟢 Running" if is_running else "🔴 Stopped"
+    status_emoji = "🟢 Active" if is_running else "🔴 Stopped"
     
     message = (
-        f"📊 *Current Status*\n\n"
+        f"📊 *Status Report*\n\n"
         f"Status: {status_emoji}\n\n"
-        f"{preferences.get_summary()}"
+        f"*Settings:*\n"
+        f"{preferences.get_summary()}\n\n"
+        f"*Stats:*\n"
+        f"• Slots notified: {len(preferences.last_notified_slots)}\n"
+        f"• Auth required: ❌ None!\n\n"
+        f"_Last updated: {datetime.now().strftime('%H:%M:%S')}_"
     )
     
     await update.message.reply_text(message, parse_mode="Markdown")
@@ -651,8 +737,9 @@ async def set_visa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "📋 Select your Visa Type:",
-        reply_markup=reply_markup
+        "📋 *Select Visa Type:*",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
     )
 
 
@@ -664,8 +751,9 @@ async def set_consulate_command(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "🏛️ Select Consulate City:",
-        reply_markup=reply_markup
+        "🏛️ *Select Consulate City:*",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
     )
 
 
@@ -677,8 +765,9 @@ async def set_interval_command(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "⏰ Select Check Interval:",
-        reply_markup=reply_markup
+        "⏰ *Select Check Interval:*",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
     )
 
 
@@ -696,27 +785,27 @@ async def start_alerts_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not preferences.is_complete():
         await message.reply_text(
-            "⚠️ *Incomplete Configuration*\n\n"
-            "Please set all required fields:\n"
-            "• Visa Type (/set\\_visa)\n"
-            "• Consulate (/set\\_consulate)\n"
-            "• Interval (/set\\_interval)",
+            "⚠️ *Setup Incomplete*\n\n"
+            "Please complete setup:\n"
+            "1. /set\\_visa\n"
+            "2. /set\\_consulate\n"
+            "3. /set\\_interval",
             parse_mode="Markdown"
         )
         return
 
     if await user_manager.is_running(chat_id):
-        await message.reply_text("⚠️ Alerts are already running!")
+        await message.reply_text("⚠️ Already monitoring!")
         return
 
     summary = (
-        f"🔔 *Alerts Started!*\n\n"
+        f"🔔 *Monitoring Started!*\n\n"
         f"{preferences.get_summary()}\n\n"
-        f"⏳ Checking for slots now..."
+        f"✅ NO authentication needed\n"
+        f"⏳ First check starting now..."
     )
     await message.reply_text(summary, parse_mode="Markdown")
 
-    # Create and start alert task
     messenger = TelegramMessenger(BOT_TOKEN)
     alert_system = AlertSystem(messenger)
     task = asyncio.create_task(alert_system.run_alert_loop(chat_id))
@@ -735,9 +824,13 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
         await user_manager.remove_alert_task(chat_id)
-        await update.message.reply_text("🛑 Alerts stopped successfully.")
+        await update.message.reply_text(
+            "🛑 *Monitoring Stopped*\n\n"
+            "Use /start\\_alerts to resume",
+            parse_mode="Markdown"
+        )
     else:
-        await update.message.reply_text("⚠️ No alerts are currently running.")
+        await update.message.reply_text("⚠️ Not currently monitoring")
 
 
 # =============================================================================
@@ -754,114 +847,57 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("visa_"):
-        await handle_visa_selection(query, preferences, data)
+        preferences.visa_type = data.replace("visa_", "")
+        await query.message.reply_text(f"✅ Visa: {preferences.visa_type}")
+        
+        keyboard = [[InlineKeyboardButton(city, callback_data=f"city_{city}")] for city in CITIES]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text("🏛️ *Select City:*", reply_markup=reply_markup, parse_mode="Markdown")
         
     elif data.startswith("city_"):
-        await handle_city_selection(query, preferences, data)
+        preferences.consulate_city = data.replace("city_", "")
+        await query.message.reply_text(f"✅ City: {preferences.consulate_city}")
+        
+        keyboard = [[InlineKeyboardButton(t, callback_data=f"type_{t}")] for t in CONSULATE_TYPES]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text("🏢 *Select Type:*", reply_markup=reply_markup, parse_mode="Markdown")
         
     elif data.startswith("type_"):
-        await handle_type_selection(query, preferences, data)
+        preferences.consulate_type = data.replace("type_", "")
+        await query.message.reply_text(f"✅ Type: {preferences.consulate_type}")
+        
+        keyboard = [[InlineKeyboardButton(y, callback_data=f"year_{y}")] for y in YEAR_OPTIONS]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text("📅 *Year Filter:*", reply_markup=reply_markup, parse_mode="Markdown")
         
     elif data.startswith("year_"):
-        await handle_year_selection(query, preferences, data)
+        selection = data.replace("year_", "")
+        preferences.year_filter = None if selection == "No Filter" else [selection]
+        await query.message.reply_text(f"✅ Year: {selection}")
+        
+        keyboard = [[InlineKeyboardButton(i, callback_data=f"interval_{i}")] for i in INTERVALS.keys()]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text("⏰ *Check Interval:*", reply_markup=reply_markup, parse_mode="Markdown")
         
     elif data.startswith("interval_"):
-        await handle_interval_selection(query, preferences, data)
+        interval_key = data.replace("interval_", "")
+        preferences.interval = INTERVALS[interval_key]
+        await query.message.reply_text(f"✅ Interval: {interval_key}")
+        
+        summary = (
+            "🎯 *Setup Complete!*\n\n"
+            f"{preferences.get_summary()}\n\n"
+            "✅ No authentication required!"
+        )
+        
+        keyboard = [[InlineKeyboardButton("🚀 Start Monitoring", callback_data="start_alerts")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.reply_text(summary, parse_mode="Markdown")
+        await query.message.reply_text("Ready to start:", reply_markup=reply_markup)
         
     elif data == "start_alerts":
-        # Create Update object for start_alerts_command
         await start_alerts_command(update, context)
-
-
-async def handle_visa_selection(query, preferences: UserPreferences, data: str):
-    """Handle visa type selection"""
-    preferences.visa_type = data.replace("visa_", "")
-    await query.message.reply_text(f"✅ Visa Type: {preferences.visa_type}")
-    
-    keyboard = [
-        [InlineKeyboardButton(city, callback_data=f"city_{city}")]
-        for city in CITIES
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text(
-        "🏛️ Select Consulate City:",
-        reply_markup=reply_markup
-    )
-
-
-async def handle_city_selection(query, preferences: UserPreferences, data: str):
-    """Handle city selection"""
-    preferences.consulate_city = data.replace("city_", "")
-    await query.message.reply_text(f"✅ City: {preferences.consulate_city}")
-    
-    keyboard = [
-        [InlineKeyboardButton(ctype, callback_data=f"type_{ctype}")]
-        for ctype in CONSULATE_TYPES
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text(
-        "🏢 Select Consulate Type:",
-        reply_markup=reply_markup
-    )
-
-
-async def handle_type_selection(query, preferences: UserPreferences, data: str):
-    """Handle consulate type selection"""
-    preferences.consulate_type = data.replace("type_", "")
-    await query.message.reply_text(f"✅ Type: {preferences.consulate_type}")
-    
-    keyboard = [
-        [InlineKeyboardButton(year, callback_data=f"year_{year}")]
-        for year in YEAR_OPTIONS
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text(
-        "📅 Select Year Filter:",
-        reply_markup=reply_markup
-    )
-
-
-async def handle_year_selection(query, preferences: UserPreferences, data: str):
-    """Handle year filter selection"""
-    selection = data.replace("year_", "")
-    if selection == "No Filter":
-        preferences.year_filter = None
-    else:
-        preferences.year_filter = [selection]
-    
-    await query.message.reply_text(f"✅ Year Filter: {selection}")
-    
-    keyboard = [
-        [InlineKeyboardButton(interval, callback_data=f"interval_{interval}")]
-        for interval in INTERVALS.keys()
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text(
-        "⏰ Select Check Interval:",
-        reply_markup=reply_markup
-    )
-
-
-async def handle_interval_selection(query, preferences: UserPreferences, data: str):
-    """Handle interval selection"""
-    interval_key = data.replace("interval_", "")
-    preferences.interval = INTERVALS[interval_key]
-    
-    await query.message.reply_text(f"✅ Interval: {interval_key}")
-    
-    summary = (
-        "🎯 *Configuration Complete!*\n\n"
-        f"{preferences.get_summary()}"
-    )
-    
-    keyboard = [[InlineKeyboardButton("🚀 Start Alerts", callback_data="start_alerts")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.message.reply_text(summary, parse_mode="Markdown")
-    await query.message.reply_text(
-        "Click below to start monitoring:",
-        reply_markup=reply_markup
-    )
 
 
 # =============================================================================
@@ -874,29 +910,28 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if update and update.effective_message:
         await update.effective_message.reply_text(
-            "❌ An error occurred. Please try again or contact support."
+            "❌ *Error occurred*\n\n"
+            "Please try again or use /help",
+            parse_mode="Markdown"
         )
 
 
 # =============================================================================
-# MAIN APPLICATION
+# MAIN
 # =============================================================================
 
 def main():
-    """Main application entry point"""
-    logger.info("=" * 50)
-    logger.info("Starting Visa Slot Alert Bot")
-    logger.info("=" * 50)
+    """Main entry point"""
+    logger.info("=" * 60)
+    logger.info("🤖 Visa Slot Alert Bot - Starting")
+    logger.info("=" * 60)
     
-    # Validate environment
     if not validate_environment():
-        logger.error("Environment validation failed. Exiting.")
         sys.exit(1)
     
-    # Build application
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Add command handlers
+    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -906,15 +941,13 @@ def main():
     app.add_handler(CommandHandler("start_alerts", start_alerts_command))
     app.add_handler(CommandHandler("stop", stop_command))
     
-    # Add callback handler
+    # Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
     
-    # Add error handler
+    # Errors
     app.add_error_handler(error_handler)
     
-    logger.info("🤖 Bot is running and ready to receive commands...")
-    
-    # Run bot
+    logger.info("✅ Bot ready - NO OTP REQUIRED!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
@@ -922,7 +955,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("🛑 Stopped by user")
     except Exception as e:
-        logger.critical(f"Critical error: {e}", exc_info=True)
+        logger.critical(f"💥 Critical error: {e}", exc_info=True)
         sys.exit(1)
